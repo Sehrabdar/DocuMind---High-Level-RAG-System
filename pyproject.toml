@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "documind"
+version = "0.1.0"
+description = "Production-oriented RAG system for technical documentation"
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    # Document loading / parsing
+    "llama-index-core>=0.10.0,<0.11.0",
+    "llama-index-readers-file>=0.1.0,<0.2.0",
+    # PDF
+    "pypdf>=4.0.0,<5.0.0",
+    # DOCX
+    "python-docx>=1.1.0,<2.0.0",
+    # HTML parsing
+    "beautifulsoup4>=4.12.0,<5.0.0",
+    "lxml>=5.0.0,<6.0.0",
+    # Config / validation
+    "pydantic>=2.5.0,<3.0.0",
+    "pydantic-settings>=2.1.0,<3.0.0",
+    # CLI
+    "click>=8.1.0,<9.0.0",
+    # Utilities
+    "rich>=13.0.0,<14.0.0",
+]
+
+[project.scripts]
+documind-ingest = "documind.ingestion.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0,<9.0.0",
+    "pytest-cov>=5.0.0,<6.0.0",
+    "ruff>=0.4.0,<0.5.0",
+    "mypy>=1.9.0,<2.0.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

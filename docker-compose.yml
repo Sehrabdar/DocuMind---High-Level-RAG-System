@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: documind-postgres
+    environment:
+      POSTGRES_USER: documind
+      POSTGRES_PASSWORD: documind
+      POSTGRES_DB: documind
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U documind -d documind"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NOTE: PostgreSQL + pgvector is provisioned here for Phase 3+.
+# Phase 1 (ingestion) does not connect to the database.
+# Run `docker compose up -d` when you are ready to implement Phase 3.
+# ──────────────────────────────────────────────────────────────────────────────
