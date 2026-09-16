@@ -24,6 +24,7 @@ from rich.table import Table
 from rich import box
 
 from config import settings
+from documind.ingestion.chunking import NormalizedChunk, chunk_document
 from documind.ingestion.pipeline import ingest_directory
 
 console = Console()
@@ -117,6 +118,64 @@ def _print_summary(result, input_path: Path) -> None:
         )
 
 
+def _print_chunk_summary(all_chunks: list[NormalizedChunk]) -> None:
+    """Render a Rich chunking summary to the console."""
+    if not all_chunks:
+        console.print("[dim]No chunks produced.[/dim]\n")
+        return
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold magenta]DocuMind Chunking[/bold magenta]",
+            border_style="magenta",
+        )
+    )
+
+    token_counts = [c.token_count for c in all_chunks]
+    docs_with_chunks = len({c.document_id for c in all_chunks})
+    chunks_with_section = sum(1 for c in all_chunks if c.section_path)
+
+    summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    summary.add_column("Label", style="dim")
+    summary.add_column("Value", justify="right", style="bold")
+
+    summary.add_row("Documents chunked", str(docs_with_chunks))
+    summary.add_row("Total chunks", str(len(all_chunks)))
+    summary.add_row("Chunks with section path", str(chunks_with_section))
+    summary.add_row("", "")
+    summary.add_row("Min tokens / chunk", str(min(token_counts)))
+    summary.add_row("Max tokens / chunk", str(max(token_counts)))
+    avg = sum(token_counts) / len(token_counts)
+    summary.add_row("Avg tokens / chunk", f"{avg:.0f}")
+    summary.add_row("Total tokens", str(sum(token_counts)))
+
+    console.print(summary)
+
+    # Per-document breakdown
+    doc_table = Table(box=box.SIMPLE, show_header=True, padding=(0, 2))
+    doc_table.add_column("Document", style="cyan")
+    doc_table.add_column("Chunks", justify="right")
+    doc_table.add_column("Tokens", justify="right")
+    doc_table.add_column("Sections", justify="right")
+
+    from itertools import groupby
+    by_doc: dict[str, list[NormalizedChunk]] = {}
+    for chunk in all_chunks:
+        by_doc.setdefault(chunk.document_id, []).append(chunk)
+
+    for doc_id, doc_chunks in sorted(by_doc.items(), key=lambda kv: kv[1][0].chunk_index):
+        # Use document_title or truncated doc_id
+        label = (doc_chunks[0].document_title or doc_id[:12] + "…")
+        n_chunks = len(doc_chunks)
+        n_tokens = sum(c.token_count for c in doc_chunks)
+        n_sections = len({tuple(c.section_path) for c in doc_chunks if c.section_path})
+        doc_table.add_row(label, str(n_chunks), str(n_tokens), str(n_sections))
+
+    console.print(doc_table)
+    console.print("[bold magenta]✓ Chunking complete[/bold magenta]\n")
+
+
 @click.command(name="documind-ingest")
 @click.option(
     "--input",
@@ -139,15 +198,41 @@ def _print_summary(result, input_path: Path) -> None:
     default=False,
     help="Abort on the first document that fails to load.",
 )
+@click.option(
+    "--chunk",
+    "do_chunk",
+    is_flag=True,
+    default=False,
+    help="Run structure-aware chunking after ingestion and print chunk statistics.",
+)
+@click.option(
+    "--chunk-size",
+    "chunk_size",
+    type=int,
+    default=None,
+    help="Max tokens per chunk (default: DOCUMIND_CHUNK_SIZE or 512).",
+)
+@click.option(
+    "--chunk-overlap",
+    "chunk_overlap",
+    type=int,
+    default=None,
+    help="Overlap tokens between sub-chunks (default: DOCUMIND_CHUNK_OVERLAP or 50).",
+)
 def main(
     input_path: Path | None,
     log_level: str | None,
     fail_fast: bool,
+    do_chunk: bool,
+    chunk_size: int | None,
+    chunk_overlap: int | None,
 ) -> None:
     """Ingest a corpus directory and print a summary.
 
     All supported documents (.md, .pdf, .html, .htm, .docx) found recursively
     under INPUT are loaded and normalized.  A summary is printed to stdout.
+
+    Pass --chunk to also run structure-aware chunking and see chunk statistics.
     """
     effective_log_level = log_level or settings.log_level
     _configure_logging(effective_log_level)
@@ -169,6 +254,32 @@ def main(
         raise
 
     _print_summary(result, effective_input)
+
+    if do_chunk and result.documents:
+        effective_chunk_size = chunk_size or settings.chunk_size
+        effective_overlap = chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
+
+        all_chunks: list[NormalizedChunk] = []
+        chunk_failures = 0
+        for doc in result.documents:
+            try:
+                chunks = chunk_document(
+                    doc,
+                    chunk_size=effective_chunk_size,
+                    chunk_overlap=effective_overlap,
+                )
+                all_chunks.extend(chunks)
+            except Exception as exc:
+                chunk_failures += 1
+                console.print(
+                    f"[red]Chunking failed for '{doc.filename}': {exc}[/red]"
+                )
+
+        _print_chunk_summary(all_chunks)
+        if chunk_failures:
+            console.print(
+                f"[bold yellow]⚠ {chunk_failures} document(s) failed to chunk[/bold yellow]\n"
+            )
 
     # Exit with non-zero code if there were any failures
     if result.failed:
