@@ -17,7 +17,7 @@ inline citations, and RAGAS-based evaluation.
 | 0     | Architecture Decisions       | ✅ Complete    |
 | 1     | Corpus & Document Ingestion  | ✅ Complete    |
 | 2     | Structure-Aware Chunking     | ✅ Complete    |
-| 3     | Embeddings + pgvector        | ⏳ Planned     |
+| 3     | Embeddings + pgvector        | ✅ Complete    |
 | 4     | Hybrid Retrieval + RRF       | ⏳ Planned     |
 | 5     | Cross-Encoder Reranking      | ⏳ Planned     |
 | 6     | Grounded Generation + Citations | ⏳ Planned  |
@@ -517,4 +517,163 @@ Validation rules (enforced at startup):
 - `chunk_size > 0`
 - `chunk_overlap >= 0`
 - `chunk_overlap < chunk_size`
+- `embedding_dimension > 0`
+- `embedding_batch_size > 0`
+
+---
+
+## Phase 3 — Embeddings + pgvector
+
+### Pipeline
+
+```
+NormalizedChunk (from Phase 2)
+        ↓
+EmbeddingService (BAAI/bge-small-en-v1.5)
+        ↓
+L2-normalized 384-dimensional vector
+        ↓
+ChunkRepository.upsert_chunks()
+        ↓
+PostgreSQL + pgvector (chunks table, HNSW index)
+```
+
+### Why local BGE embeddings?
+
+`BAAI/bge-small-en-v1.5` runs entirely locally with `sentence-transformers`.
+
+- **No per-document API cost**: Embedding a 10,000-chunk corpus costs zero API
+  calls.  Reproducibility does not depend on a vendor API staying stable.
+- **Reproducible vectors**: Same text + same model → identical vector.  This
+  is essential for deterministic ingestion and idempotency testing.
+- **Appropriate dimensionality**: 384 dimensions is a practical balance between
+  semantic quality and index size.  A 768-dimensional model (e.g. `bge-base`)
+  doubles the index size for a modest recall improvement that may not matter
+  for technical documentation.
+- **MTEB performance**: `bge-small-en-v1.5` scores competitively on MTEB
+  English semantic similarity tasks.  It is not the highest-performing model,
+  but it is the correct baseline for a project that prioritizes reproducibility
+  and local execution.
+- **Cosine similarity**: BGE models are trained with cosine similarity.
+  L2-normalizing the output before storage means cosine similarity equals
+  dot product, which pgvector's HNSW index handles efficiently.
+
+### Why pgvector?
+
+The project already uses PostgreSQL (Phase 0 decision).  pgvector extends
+PostgreSQL with a vector column type and index — no separate vector database
+is needed.  This keeps the infrastructure footprint small and provenance
+metadata co-located with embeddings in the same transaction.
+
+### Why HNSW?
+
+HNSW (Hierarchical Navigable Small World) is an approximate nearest-neighbor
+index that provides O(log N) query time without a training step.
+
+Compared to the other pgvector option (IVFFlat):
+- **No training step**: IVFFlat requires running `CREATE INDEX ... WITH (lists=N)`
+  on a representative sample.  HNSW works on an empty table and grows
+  incrementally.
+- **Better recall at lower ef_search**: For a technical documentation corpus
+  that does not exceed millions of chunks, HNSW is the more practical choice.
+
+Index parameters:
+- `m=16` — maximum connections per layer (pgvector default, reasonable for
+  most workloads)
+- `ef_construction=64` — candidate list size during build (higher = better
+  recall at build time, lower = faster build)
+
+These parameters are starting points.  Tuning against real recall@K metrics
+belongs to the evaluation phase.
+
+### Why cosine distance?
+
+BGE embeddings are L2-normalized before storage.  For unit-norm vectors:
+
+```
+cosine_similarity(a, b) = dot(a, b)
+cosine_distance(a, b)   = 1 - dot(a, b)
+```
+
+The `vector_cosine_ops` operator class in pgvector's HNSW index directly
+optimizes for this distance function.  Using inner product (`vector_ip_ops`)
+would be equivalent after L2 normalization, but cosine is more conventional
+and its semantics are explicit.
+
+### Why separate embedding and persistence layers?
+
+`EmbeddingService` and `ChunkRepository` are deliberately separate:
+
+- **Testability**: `EmbeddingService` is tested with `FakeEmbeddingProvider`
+  (no DB, no model download).  `ChunkRepository` is tested with a real DB but
+  without the embedding model.
+- **Future flexibility**: The embedding model can be swapped without touching
+  persistence code.  The persistence schema can change without touching
+  embedding code.
+- **Phase clarity**: Embedding is a transformation step.  Persistence is an
+  I/O step.  Mixing them would make both harder to reason about.
+
+### Why deterministic chunk IDs?
+
+`chunk_id = SHA-256(doc_id:chunk_index:content[:64])`
+
+Running the ingestion pipeline twice on the same document produces the same
+chunk IDs.  The database has a `UNIQUE(chunk_id)` constraint.  Re-ingesting
+the same document does `INSERT ... ON CONFLICT DO UPDATE` — updating the
+row in-place rather than creating a duplicate.  This makes the pipeline
+idempotent by design.
+
+### Schema design: explicit columns vs JSONB
+
+Fields that retrieval and filtering queries will use (`document_id`,
+`chunk_index`, `page`, `start_char`, `end_char`) are explicit columns.
+`section_path` is JSONB because it is a variable-length list — explicit
+columns would require either delimiter encoding or a join table, neither of
+which simplifies retrieval at this stage.
+
+### Running Phase 3
+
+```bash
+# 1. Start PostgreSQL + pgvector
+docker compose up -d
+
+# 2. Apply migrations
+uv run alembic upgrade head
+
+# 3. Full pipeline: ingest → chunk → embed → persist
+uv run python -m documind.ingestion \
+    --input data/corpus \
+    --chunk \
+    --embed
+
+# With custom settings
+uv run python -m documind.ingestion \
+    --input data/corpus \
+    --chunk \
+    --chunk-size 256 \
+    --embed \
+    --database-url "postgresql+asyncpg://user:pass@host/db"
+```
+
+### New environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOCUMIND_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | HuggingFace model name |
+| `DOCUMIND_EMBEDDING_DIMENSION` | `384` | Vector dimension (must match model) |
+| `DOCUMIND_EMBEDDING_BATCH_SIZE` | `64` | Chunks per encoding batch |
+| `DOCUMIND_DATABASE_URL` | Docker Compose default | PostgreSQL async URL |
+
+### Running integration tests
+
+```bash
+# Unit tests only (no DB, no model download)
+uv run pytest -m "not integration and not model_integration" -v
+
+# Integration tests (requires docker compose up -d && alembic upgrade head)
+uv run pytest tests/integration/ -m integration -v
+
+# Real model tests (requires model download ~130MB)
+uv run pytest tests/integration/test_real_embeddings.py -m model_integration -v
+```
 

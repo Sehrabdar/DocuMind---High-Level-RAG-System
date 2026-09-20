@@ -57,6 +57,51 @@ class Settings(BaseSettings):
     independent sections.
     """
 
+    # ── Embeddings ────────────────────────────────────────────────────────────
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    """HuggingFace model identifier for the local embedding model.
+
+    BAAI/bge-small-en-v1.5 was selected as the Phase 3 baseline because it:
+    - Runs locally (no per-document API cost)
+    - Produces 384-dimensional vectors (manageable pgvector index size)
+    - Performs competitively on MTEB semantic similarity benchmarks
+    - Recommends L2-normalized cosine similarity (matching pgvector HNSW setup)
+    - Is reproducible: same input → same vector, deterministically
+    """
+
+    embedding_dimension: int = 384
+    """Output vector dimension for the configured embedding model.
+
+    This is the single authoritative dimension value.  The SQLAlchemy model
+    and Alembic migration both read from this configuration.  If the model
+    changes, update this value and generate a new migration — the discrepancy
+    will be explicit rather than scattered across the codebase.
+    """
+
+    embedding_batch_size: int = 64
+    """Number of texts to encode per batch.
+
+    Balances GPU/CPU utilisation against memory pressure.  The default of 64
+    is conservative and works on CPU-only machines.  Increase for GPU inference.
+    """
+
+    # ── Database ──────────────────────────────────────────────────────────────
+    database_url: str = (
+        "postgresql+asyncpg://documind:documind@localhost:5434/documind"
+    )
+    """SQLAlchemy async database URL.
+
+    Uses asyncpg as the async driver, matching the FastAPI-oriented Phase 8
+    architecture.  Starting async now avoids a painful sync→async migration later.
+
+    Host port 5434 maps to the Docker Compose container's port 5432 to avoid
+    conflict with any local PostgreSQL instance on the standard port.
+    Credentials default to the Docker Compose values — never commit a real
+    credentials-bearing URL.
+    """
+
+    # ── Validators ────────────────────────────────────────────────────────────
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _uppercase_log_level(cls, v: str) -> str:
@@ -74,6 +119,20 @@ class Settings(BaseSettings):
     def _validate_chunk_overlap(cls, v: int) -> int:
         if int(v) < 0:
             raise ValueError(f"chunk_overlap must be >= 0, got {v}")
+        return int(v)
+
+    @field_validator("embedding_dimension", mode="before")
+    @classmethod
+    def _validate_embedding_dimension(cls, v: int) -> int:
+        if int(v) <= 0:
+            raise ValueError(f"embedding_dimension must be > 0, got {v}")
+        return int(v)
+
+    @field_validator("embedding_batch_size", mode="before")
+    @classmethod
+    def _validate_embedding_batch_size(cls, v: int) -> int:
+        if int(v) <= 0:
+            raise ValueError(f"embedding_batch_size must be > 0, got {v}")
         return int(v)
 
     @model_validator(mode="after")

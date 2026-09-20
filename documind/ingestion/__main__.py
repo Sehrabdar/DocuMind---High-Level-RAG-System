@@ -176,6 +176,40 @@ def _print_chunk_summary(all_chunks: list[NormalizedChunk]) -> None:
     console.print("[bold magenta]✓ Chunking complete[/bold magenta]\n")
 
 
+def _print_embed_summary(
+    total_chunks: int,
+    upserted: int,
+    failed: int,
+    elapsed_s: float,
+) -> None:
+    """Render a Rich embedding + persistence summary."""
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold blue]DocuMind Embedding[/bold blue]",
+            border_style="blue",
+        )
+    )
+    summary = Table(box=box.SIMPLE, show_header=False, padding=(0, 2))
+    summary.add_column("Label", style="dim")
+    summary.add_column("Value", justify="right", style="bold")
+    summary.add_row("Chunks processed", str(total_chunks))
+    summary.add_row("Records upserted", str(upserted))
+    if failed:
+        summary.add_row("[red]Failed[/red]", f"[red]{failed}[/red]")
+    summary.add_row("Elapsed", f"{elapsed_s:.1f}s")
+    if total_chunks > 0 and elapsed_s > 0:
+        cps = total_chunks / elapsed_s
+        summary.add_row("Throughput", f"{cps:.0f} chunks/s")
+    console.print(summary)
+    if failed == 0:
+        console.print("[bold blue]✓ Embedding complete[/bold blue]\n")
+    else:
+        console.print(
+            f"[bold yellow]⚠ Embedding complete with {failed} failure(s)[/bold yellow]\n"
+        )
+
+
 @click.command(name="documind-ingest")
 @click.option(
     "--input",
@@ -219,6 +253,19 @@ def _print_chunk_summary(all_chunks: list[NormalizedChunk]) -> None:
     default=None,
     help="Overlap tokens between sub-chunks (default: DOCUMIND_CHUNK_OVERLAP or 50).",
 )
+@click.option(
+    "--embed",
+    "do_embed",
+    is_flag=True,
+    default=False,
+    help="Embed chunks and persist them to PostgreSQL (requires --chunk).",
+)
+@click.option(
+    "--database-url",
+    "database_url",
+    default=None,
+    help="PostgreSQL URL (default: DOCUMIND_DATABASE_URL or docker-compose default).",
+)
 def main(
     input_path: Path | None,
     log_level: str | None,
@@ -226,13 +273,16 @@ def main(
     do_chunk: bool,
     chunk_size: int | None,
     chunk_overlap: int | None,
+    do_embed: bool,
+    database_url: str | None,
 ) -> None:
-    """Ingest a corpus directory and print a summary.
+    """Ingest a corpus directory, optionally chunk and embed to PostgreSQL.
 
     All supported documents (.md, .pdf, .html, .htm, .docx) found recursively
     under INPUT are loaded and normalized.  A summary is printed to stdout.
 
     Pass --chunk to also run structure-aware chunking and see chunk statistics.
+    Pass --embed (with --chunk) to embed chunks and persist to PostgreSQL.
     """
     effective_log_level = log_level or settings.log_level
     _configure_logging(effective_log_level)
@@ -255,11 +305,12 @@ def main(
 
     _print_summary(result, effective_input)
 
+    all_chunks: list[NormalizedChunk] = []
+
     if do_chunk and result.documents:
         effective_chunk_size = chunk_size or settings.chunk_size
         effective_overlap = chunk_overlap if chunk_overlap is not None else settings.chunk_overlap
 
-        all_chunks: list[NormalizedChunk] = []
         chunk_failures = 0
         for doc in result.documents:
             try:
@@ -280,6 +331,80 @@ def main(
             console.print(
                 f"[bold yellow]⚠ {chunk_failures} document(s) failed to chunk[/bold yellow]\n"
             )
+
+    if do_embed:
+        if not do_chunk:
+            console.print(
+                "[bold red]Error:[/bold red] --embed requires --chunk. "
+                "Run with: --chunk --embed"
+            )
+            sys.exit(1)
+
+        if not all_chunks:
+            console.print("[dim]No chunks to embed.[/dim]\n")
+        else:
+            import asyncio
+            import time
+
+            from documind.embeddings.service import create_embedding_service
+            from db.models import chunk_record_from_normalized
+            from db.repository import ChunkRepository
+            from db.session import get_async_session, get_engine, get_session_factory
+
+            effective_db_url = database_url or settings.database_url
+            effective_batch = settings.embedding_batch_size
+
+            console.print(
+                f"[dim]Loading embedding model: {settings.embedding_model}…[/dim]"
+            )
+            try:
+                embedding_svc = create_embedding_service(settings.embedding_model)
+            except Exception as exc:
+                console.print(f"[bold red]Failed to load embedding model:[/bold red] {exc}")
+                sys.exit(1)
+
+            total_upserted = 0
+            total_failed = 0
+            t0 = time.monotonic()
+
+            async def _embed_and_persist() -> None:
+                nonlocal total_upserted, total_failed
+                engine = get_engine(effective_db_url)
+                session_factory = get_session_factory(engine)
+                repo = ChunkRepository()
+
+                for batch_start in range(0, len(all_chunks), effective_batch):
+                    batch = all_chunks[batch_start : batch_start + effective_batch]
+                    texts = [c.content for c in batch]
+                    try:
+                        embeddings = embedding_svc.embed_texts(
+                            texts,
+                            batch_size=effective_batch,
+                            show_progress_bar=False,
+                        )
+                    except Exception as exc:
+                        total_failed += len(batch)
+                        console.print(f"[red]Embedding batch failed: {exc}[/red]")
+                        continue
+
+                    records = [
+                        chunk_record_from_normalized(chunk, emb)
+                        for chunk, emb in zip(batch, embeddings)
+                    ]
+
+                    try:
+                        async with get_async_session(session_factory) as session:
+                            upserted = await repo.upsert_chunks(records, session)
+                            total_upserted += upserted
+                    except Exception as exc:
+                        total_failed += len(batch)
+                        console.print(f"[red]Persistence batch failed: {exc}[/red]")
+
+                await engine.dispose()
+
+            asyncio.run(_embed_and_persist())
+            elapsed = time.monotonic() - t0
+            _print_embed_summary(len(all_chunks), total_upserted, total_failed, elapsed)
 
     # Exit with non-zero code if there were any failures
     if result.failed:
