@@ -12,17 +12,18 @@ inline citations, and RAGAS-based evaluation.
 
 ## Project Status
 
-| Phase | Title                        | Status         |
-|-------|------------------------------|----------------|
-| 0     | Architecture Decisions       | ✅ Complete    |
-| 1     | Corpus & Document Ingestion  | ✅ Complete    |
-| 2     | Structure-Aware Chunking     | ✅ Complete    |
-| 3     | Embeddings + pgvector        | ✅ Complete    |
-| 4     | Hybrid Retrieval + RRF       | ⏳ Planned     |
-| 5     | Cross-Encoder Reranking      | ⏳ Planned     |
-| 6     | Grounded Generation + Citations | ⏳ Planned  |
-| 7     | RAGAS Evaluation             | ⏳ Planned     |
-| 8     | FastAPI + Cloud Run          | ⏳ Planned     |
+| Phase | Title                           | Status         |
+|-------|---------------------------------|----------------|
+| 0     | Architecture Decisions          | ✅ Complete    |
+| 1     | Corpus & Document Ingestion     | ✅ Complete    |
+| 2     | Structure-Aware Chunking        | ✅ Complete    |
+| 3     | Embeddings + pgvector           | ✅ Complete    |
+| 4     | Baseline Dense Retrieval        | ✅ Complete    |
+| 5     | Hybrid Retrieval + RRF          | ⏳ Planned     |
+| 6     | Cross-Encoder Reranking         | ⏳ Planned     |
+| 7     | Grounded Generation + Citations | ⏳ Planned     |
+| 8     | RAGAS Evaluation                | ⏳ Planned     |
+| 9     | FastAPI + Cloud Run             | ⏳ Planned     |
 
 ---
 
@@ -675,5 +676,129 @@ uv run pytest tests/integration/ -m integration -v
 
 # Real model tests (requires model download ~130MB)
 uv run pytest tests/integration/test_real_embeddings.py -m model_integration -v
+```
+
+---
+
+## Phase 4 — Baseline Dense Retrieval
+
+### What dense retrieval does
+
+Phase 4 establishes the first working retrieval baseline: given a natural-language
+query, find the most semantically similar chunks in the database using vector
+similarity search.
+
+```
+User Query
+    ↓
+EmbeddingService.embed_text()       ← same model as document embedding (BGE-small-en-v1.5)
+    ↓
+384-dimensional L2-normalized vector
+    ↓
+VectorRepository.search()
+    ↓
+pgvector <=> operator (cosine distance)
+    ↓
+HNSW index (from Phase 3 migration)
+    ↓
+Top-K (chunk_id, distance) pairs
+    ↓
+DenseRetriever.retrieve()           ← assembles RetrievedChunk results
+    ↓
+list[RetrievedChunk]                ← typed, with rank + scores + provenance
+```
+
+### Why dense retrieval is the baseline
+
+Starting with dense retrieval alone gives us a single, measurable system.
+Later phases will add:
+
+- **Phase 5**: BM25 keyword retrieval (Baseline B) + Reciprocal Rank Fusion
+- **Phase 6**: Cross-encoder reranking
+
+By building incrementally, we can isolate the contribution of each component:
+
+```
+Baseline A   Dense only              ← Phase 4
+Baseline B   Keyword only            ← Phase 5
+System C     Dense + Keyword + RRF   ← Phase 5
+System D     Dense + Keyword + RRF + Reranking  ← Phase 6
+```
+
+No claims about retrieval quality are made at this stage.
+Formal evaluation (Recall@K, MRR, NDCG) belongs to a later evaluation phase.
+
+### Score semantics
+
+pgvector's `<=>` operator returns **cosine distance** (not similarity):
+
+```
+distance = 1 - cosine_similarity
+range:  [0, 2]  for L2-normalized unit vectors
+  0.0 = identical direction → perfect semantic match
+  1.0 = orthogonal         → unrelated
+  2.0 = opposite direction
+```
+
+`RetrievedChunk` exposes both:
+- `distance` — raw pgvector value, lower is better, use for sorting
+- `similarity = 1 - distance` — higher is better, for display
+
+Results are always ordered by **ascending distance** (rank 1 = closest).
+
+### Architecture
+
+```
+DenseRetriever          ← documind/retrieval/service.py
+   ├── EmbeddingService ← reuses Phase 3 (no new model code)
+   └── VectorRepository ← db/vector_repository.py
+
+VectorRepository
+   └── SELECT … ORDER BY embedding <=> query_vector LIMIT k
+
+RetrievedChunk          ← documind/retrieval/models.py
+   ├── chunk_id, document_id, content, section_path
+   ├── page, start_char, end_char, chunk_index
+   ├── distance (cosine distance, lower=better)
+   ├── similarity (1-distance, higher=better)
+   └── rank (1-indexed, 1=closest)
+```
+
+### Running Phase 4
+
+```bash
+# Ensure Phase 3 is set up (DB running, migration applied, corpus ingested):
+docker compose up -d
+uv run alembic upgrade head
+uv run python -m documind.ingestion --input data/corpus --chunk --embed
+
+# Query the index:
+uv run python -m documind.retrieval --query "How do I create an API key?" --top-k 5
+
+# Restrict to a specific document:
+uv run python -m documind.retrieval --query "OAuth flow" --document-id <doc_id>
+
+# Suppress chunk content (scores + metadata only):
+uv run python -m documind.retrieval --query "API keys" --no-content
+```
+
+### New environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DOCUMIND_RETRIEVAL_DEFAULT_TOP_K` | `5` | Default chunks per query |
+| `DOCUMIND_RETRIEVAL_MAX_TOP_K` | `100` | Hard ceiling on top_k |
+
+### Running Phase 4 tests
+
+```bash
+# Unit tests (no DB, no model):
+uv run pytest tests/test_retrieval_models.py tests/test_retrieval_service.py -v
+
+# Integration tests (requires docker compose up -d):
+uv run pytest tests/integration/test_retrieval.py -m integration -v
+
+# Real BGE model retrieval test:
+uv run pytest tests/integration/test_retrieval.py -m model_integration -v
 ```
 

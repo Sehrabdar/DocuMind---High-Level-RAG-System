@@ -100,6 +100,23 @@ class Settings(BaseSettings):
     credentials-bearing URL.
     """
 
+    # ── Retrieval ─────────────────────────────────────────────────────────────
+    retrieval_default_top_k: int = 5
+    """Default number of chunks returned by a single retrieval call.
+
+    Five chunks is a sensible starting point for RAG: enough context for a
+    complete answer, small enough to keep the LLM prompt compact.  Users can
+    override per-query with --top-k.
+    """
+
+    retrieval_max_top_k: int = 100
+    """Hard ceiling on top_k accepted by the retrieval API.
+
+    Prevents accidental full-table scans via the retrieval layer.  The HNSW
+    index is efficient for small K; very large K degrades to a linear scan.
+    If higher recall is needed, adjust this value and monitor query latency.
+    """
+
     # ── Validators ────────────────────────────────────────────────────────────
 
     @field_validator("log_level", mode="before")
@@ -135,11 +152,30 @@ class Settings(BaseSettings):
             raise ValueError(f"embedding_batch_size must be > 0, got {v}")
         return int(v)
 
+    @field_validator("retrieval_default_top_k", mode="before")
+    @classmethod
+    def _validate_retrieval_default_top_k(cls, v: int) -> int:
+        if int(v) <= 0:
+            raise ValueError(f"retrieval_default_top_k must be > 0, got {v}")
+        return int(v)
+
+    @field_validator("retrieval_max_top_k", mode="before")
+    @classmethod
+    def _validate_retrieval_max_top_k(cls, v: int) -> int:
+        if int(v) <= 0:
+            raise ValueError(f"retrieval_max_top_k must be > 0, got {v}")
+        return int(v)
+
     @model_validator(mode="after")
     def _validate_overlap_less_than_size(self) -> "Settings":
         if self.chunk_overlap >= self.chunk_size:
             raise ValueError(
                 f"chunk_overlap ({self.chunk_overlap}) must be < chunk_size ({self.chunk_size})"
+            )
+        if self.retrieval_default_top_k > self.retrieval_max_top_k:
+            raise ValueError(
+                f"retrieval_default_top_k ({self.retrieval_default_top_k}) "
+                f"must be <= retrieval_max_top_k ({self.retrieval_max_top_k})"
             )
         return self
 
