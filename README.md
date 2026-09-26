@@ -32,25 +32,27 @@ inline citations, and RAGAS-based evaluation.
 ```
 Documents
     ↓
-Parsing / Normalization          ← Phase 1 (this phase)
+Parsing / Normalization          ← Phase 1 (complete)
     ↓
-Structure-Aware Chunking         ← Phase 2
+Structure-Aware Chunking         ← Phase 2 (complete)
     ↓
-Embeddings (BAAI/bge-small-en-v1.5, dim=384)  ← Phase 3
+Embeddings (BAAI/bge-small-en-v1.5, dim=384)  ← Phase 3 (complete)
     ↓
-PostgreSQL + pgvector (HNSW)     ← Phase 3
+PostgreSQL + pgvector (HNSW)     ← Phase 3 (complete)
     ↓
-Dense + Keyword Retrieval        ← Phase 4
+Dense Retrieval (pgvector HNSW)  ← Phase 4 (complete)
     ↓
-RRF Fusion                       ← Phase 4
+Keyword Retrieval (PostgreSQL FTS) ← Phase 5 (complete)
     ↓
-Cross-Encoder Reranking          ← Phase 5
+RRF Hybrid Fusion                ← Phase 6
     ↓
-Grounded LLM Generation          ← Phase 6
+Cross-Encoder Reranking          ← Phase 7
     ↓
-Inline Citations                  ← Phase 6
+Grounded LLM Generation          ← Phase 8
     ↓
-Evaluation / Observability        ← Phase 7
+Inline Citations                  ← Phase 8
+    ↓
+Evaluation / Observability        ← Phase 9
 ```
 
 ---
@@ -719,10 +721,10 @@ Later phases will add:
 By building incrementally, we can isolate the contribution of each component:
 
 ```
-Baseline A   Dense only              ← Phase 4
-Baseline B   Keyword only            ← Phase 5
-System C     Dense + Keyword + RRF   ← Phase 5
-System D     Dense + Keyword + RRF + Reranking  ← Phase 6
+ Baseline A   Dense only              ← Phase 4
+ Baseline B   Keyword only            ← Phase 5
+ System C     Dense + Keyword + RRF   ← Phase 6
+ System D     Dense + Keyword + RRF + Reranking  ← Phase 7
 ```
 
 No claims about retrieval quality are made at this stage.
@@ -802,3 +804,118 @@ uv run pytest tests/integration/test_retrieval.py -m integration -v
 uv run pytest tests/integration/test_retrieval.py -m model_integration -v
 ```
 
+---
+
+## Phase 5 — Keyword Retrieval Baseline
+
+### What keyword retrieval does
+
+Phase 5 adds an independent keyword retrieval strategy using PostgreSQL native
+full-text search (FTS).  It operates on the same `chunks` table as dense retrieval
+but requires no embedding model — queries go directly to the database.
+
+```
+User Query
+    ↓
+KeywordRetriever.retrieve()         ← documind/retrieval/keyword.py
+    ↓
+KeywordRepository.search()
+    ↓
+websearch_to_tsquery('english', query)
+    ↓
+search_vector @@ query              ← GIN index on tsvector column
+    ↓
+ts_rank_cd() scores                 ← cover-density ranking
+    ↓
+Top-K rows, ordered by fts_score DESC
+    ↓
+list[RetrievedChunk]                ← retrieval_method='keyword'
+```
+
+### Score semantics
+
+Keyword and dense scores are **not comparable**:
+
+| Retriever | Score | Direction | Meaning |
+|---|---|---|---|
+| Dense | `distance` (cosine) | lower = better | pgvector `<=>` operator |
+| Dense | `similarity` = 1 - distance | higher = better | derived display value |
+| **Keyword** | **`fts_score`** (ts_rank_cd) | **higher = better** | PostgreSQL FTS cover-density rank |
+
+`fts_score` is not normalised and has no fixed upper bound.  Absolute values
+have no semantic meaning across different corpora or queries.
+
+### Schema changes (migration 0002)
+
+A generated `tsvector` column and a GIN index are added to the `chunks` table:
+
+```sql
+-- Added by alembic/versions/0002_add_fts_search_vector.py
+ALTER TABLE chunks
+  ADD COLUMN search_vector tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+
+CREATE INDEX ix_chunks_search_vector_gin
+  ON chunks USING gin(search_vector);
+```
+
+The column is maintained automatically by PostgreSQL on every INSERT/UPDATE.
+The existing upsert pipeline requires no changes.
+
+### Architecture
+
+```
+KeywordRetriever          ← documind/retrieval/keyword.py
+   └── KeywordRepository  ← db/keyword_repository.py
+
+KeywordRepository
+   └── SELECT … ts_rank_cd(search_vector, query) AS fts_score
+       FROM chunks, websearch_to_tsquery('english', :query) AS query
+       WHERE search_vector @@ query
+       ORDER BY fts_score DESC LIMIT :top_k
+
+RetrievedChunk            ← documind/retrieval/models.py
+   ├── chunk_id, document_id, content, section_path
+   ├── page, start_char, end_char, chunk_index
+   ├── retrieval_method = 'keyword'
+   ├── fts_score (ts_rank_cd value, higher=better)
+   ├── distance = None  (not applicable)
+   ├── similarity = None  (not applicable)
+   └── rank (1-indexed, 1=highest fts_score)
+
+Validation (shared)       ← documind/retrieval/validation.py
+   ├── validate_query()   ← used by both DenseRetriever and KeywordRetriever
+   └── validate_top_k()   ← used by both DenseRetriever and KeywordRetriever
+```
+
+### Running Phase 5
+
+```bash
+# Ensure migration 0002 is applied:
+uv run alembic upgrade head
+
+# Keyword retrieval (no embedding model needed):
+uv run python -m documind.retrieval --query "PostgreSQL connection pooling" --method keyword
+
+# Keyword with top-k:
+uv run python -m documind.retrieval --query "JWT authentication" --method keyword --top-k 10
+
+# Scoped to one document:
+uv run python -m documind.retrieval --query "async sessions" --method keyword --document-id <doc_id>
+
+# Dense retrieval is unchanged (default):
+uv run python -m documind.retrieval --query "How do I create an API key?" --method dense
+```
+
+### Running Phase 5 tests
+
+```bash
+# Unit tests (no DB, no model — fast):
+uv run pytest tests/test_keyword_retriever.py tests/test_keyword_repository.py -v
+
+# Integration tests (requires docker compose up -d + alembic upgrade head):
+uv run pytest tests/integration/test_keyword_retrieval.py -m integration -v
+
+# Full suite (all phases):
+uv run pytest -q
+```

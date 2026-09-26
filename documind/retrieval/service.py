@@ -48,17 +48,17 @@ from config import settings
 from db.vector_repository import VectorRepository
 from documind.embeddings.service import EmbeddingService
 from documind.retrieval.models import RetrievedChunk
+from documind.retrieval.validation import (
+    QueryValidationError,
+    validate_query,
+    validate_top_k,
+)
+
+# Re-export: callers that do `from documind.retrieval.service import QueryValidationError`
+# continue to work. The canonical definition is in documind.retrieval.validation.
+__all__ = ["DenseRetriever", "QueryValidationError"]
 
 logger = logging.getLogger(__name__)
-
-
-class QueryValidationError(ValueError):
-    """Raised when a retrieval query string fails validation.
-
-    Inherits from ValueError so callers can catch it without importing
-    this class explicitly (though they should).  The str() of this exception
-    is a human-readable message suitable for display to end users.
-    """
 
 
 class DenseRetriever:
@@ -228,31 +228,12 @@ class DenseRetriever:
                 query, top_k, session, document_id=document_id
             )
 
-    # ── Validation helpers ─────────────────────────────────────────────────────
+    # ── Validation helpers — delegated to shared module ──────────────────────
 
     def _validate_query(self, query: str) -> str:
-        """Return the stripped query or raise QueryValidationError."""
-        if not query or not query.strip():
-            raise QueryValidationError(
-                "Query must be a non-empty, non-whitespace string. "
-                f"Got: {query!r}"
-            )
-        return query.strip()
+        """Delegate to shared validation module."""
+        return validate_query(query)
 
     def _validate_top_k(self, top_k: int | None) -> int:
-        """Resolve and validate top_k, applying default and ceiling."""
-        if top_k is None:
-            return settings.retrieval_default_top_k
-
-        if not isinstance(top_k, int) or isinstance(top_k, bool):
-            raise ValueError(f"top_k must be an integer, got {type(top_k).__name__}")
-
-        if top_k <= 0:
-            raise ValueError(f"top_k must be > 0, got {top_k}")
-
-        if top_k > self._max_top_k:
-            raise ValueError(
-                f"top_k ({top_k}) exceeds maximum allowed value ({self._max_top_k}). "
-                f"Set DOCUMIND_RETRIEVAL_MAX_TOP_K to increase the limit."
-            )
-        return top_k
+        """Delegate to shared validation module."""
+        return validate_top_k(top_k, self._max_top_k)

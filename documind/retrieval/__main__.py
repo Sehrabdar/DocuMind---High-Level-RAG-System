@@ -1,26 +1,33 @@
 """
-DocuMind Retrieval CLI — Phase 4 diagnostic tool.
+DocuMind Retrieval CLI — Phase 4 (dense) + Phase 5 (keyword) diagnostic tool.
 
 Usage
 -----
+    # Dense retrieval (default):
     uv run python -m documind.retrieval --query "How do I create an API key?" --top-k 5
 
-    uv run python -m documind.retrieval \\
-        --query "OAuth refresh token flow" \\
-        --top-k 10 \\
-        --database-url "postgresql+asyncpg://user:pass@host/db"
+    # Dense retrieval (explicit):
+    uv run python -m documind.retrieval --query "..." --top-k 5 --method dense
+
+    # Keyword retrieval (no model needed):
+    uv run python -m documind.retrieval --query "PostgreSQL connection pooling" --top-k 5 --method keyword
+
+    # Keyword with document scope:
+    uv run python -m documind.retrieval --query "JWT authentication" --method keyword --document-id <id>
 
 Output
 ------
 The command prints a ranked table of retrieved chunks.  For each result:
-    - Rank, cosine distance, cosine similarity
+    - Rank, score (Dist+Sim for dense, FTS for keyword), retrieval method
     - Source document ID (first 16 chars)
     - Section path (heading breadcrumbs for Markdown documents)
     - Page number (for PDF documents)
-    - First 300 characters of chunk content
+    - Full chunk content
 
-This is a developer diagnostic tool, not a user-facing interface.
-Production retrieval will be exposed via a FastAPI endpoint in Phase 8.
+Score semantics
+---------------
+Dense:   Dist = cosine distance (lower = better), Sim = 1 - Dist (higher = better)
+Keyword: FTS  = ts_rank_cd score (higher = better), not comparable to cosine distance
 
 Exit codes
 ----------
@@ -43,7 +50,7 @@ logger = logging.getLogger(__name__)
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m documind.retrieval",
-        description="DocuMind Phase 4 — dense retrieval diagnostic.",
+        description="DocuMind retrieval diagnostic — dense (Phase 4) or keyword (Phase 5).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -59,6 +66,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="K",
         help="Number of chunks to retrieve (default: DOCUMIND_RETRIEVAL_DEFAULT_TOP_K).",
+    )
+    parser.add_argument(
+        "--method",
+        "-m",
+        choices=["dense", "keyword"],
+        default="dense",
+        help=(
+            "Retrieval strategy: 'dense' (pgvector HNSW, default) or "
+            "'keyword' (PostgreSQL FTS, no embedding model needed)."
+        ),
     )
     parser.add_argument(
         "--document-id",
@@ -80,7 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="MODEL",
         help=(
-            "HuggingFace embedding model name.  "
+            "HuggingFace embedding model name (dense only).  "
             "Defaults to DOCUMIND_EMBEDDING_MODEL (BAAI/bge-small-en-v1.5)."
         ),
     )
@@ -103,21 +120,33 @@ def _build_parser() -> argparse.ArgumentParser:
 def _print_results(
     query: str,
     results: list,
+    method: str,
     show_content: bool = True,
 ) -> None:
     """Print retrieval results as a human-readable table."""
+    from rich import box
     from rich.console import Console
     from rich.table import Table
-    from rich import box
 
     console = Console()
 
+    method_label = "Dense (cosine distance)" if method == "dense" else "Keyword (PostgreSQL FTS)"
     console.print(f"\n[bold cyan]Query:[/bold cyan] {query}")
+    console.print(f"[dim]Method:[/dim] {method_label}")
     console.print(f"[dim]{len(results)} result(s) retrieved[/dim]\n")
 
     if not results:
-        console.print("[yellow]No chunks found. Is the database populated? "
-                      "Run the ingestion pipeline first.[/yellow]")
+        if method == "keyword":
+            console.print(
+                "[yellow]No keyword matches found.  Is the database populated and "
+                "migration 0002 applied?  "
+                "Run: uv run alembic upgrade head[/yellow]"
+            )
+        else:
+            console.print(
+                "[yellow]No chunks found.  Is the database populated?  "
+                "Run the ingestion pipeline first.[/yellow]"
+            )
         return
 
     table = Table(
@@ -127,8 +156,13 @@ def _print_results(
         expand=False,
     )
     table.add_column("Rank", style="bold cyan", width=6, no_wrap=True)
-    table.add_column("Dist", width=7, no_wrap=True)
-    table.add_column("Sim", width=7, no_wrap=True)
+
+    if method == "dense":
+        table.add_column("Dist", width=7, no_wrap=True)
+        table.add_column("Sim", width=7, no_wrap=True)
+    else:
+        table.add_column("FTS Score", width=9, no_wrap=True)
+
     table.add_column("Document", width=18, no_wrap=True)
     table.add_column("Section", width=28)
     table.add_column("Page", width=5, no_wrap=True)
@@ -140,14 +174,17 @@ def _print_results(
         page = str(r.page) if r.page is not None else "[dim]—[/dim]"
         doc = r.document_id[:16] + "…"
 
-        row = [
-            str(r.rank),
-            f"{r.distance:.4f}",
-            f"{r.similarity:.4f}",
-            doc,
-            section,
-            page,
-        ]
+        if method == "dense":
+            score_cols = [
+                f"{r.distance:.4f}" if r.distance is not None else "—",
+                f"{r.similarity:.4f}" if r.similarity is not None else "—",
+            ]
+        else:
+            score_cols = [
+                f"{r.fts_score:.4f}" if r.fts_score is not None else "—",
+            ]
+
+        row = [str(r.rank), *score_cols, doc, section, page]
         if show_content:
             preview = textwrap.shorten(r.content, width=200, placeholder="…")
             row.append(preview)
@@ -156,15 +193,25 @@ def _print_results(
 
     console.print(table)
 
-    # Show full content for each result below the table
     if show_content:
         console.print()
         for r in results:
             section = " › ".join(r.section_path) if r.section_path else "(no section)"
+            if method == "dense":
+                score_str = (
+                    f"dist={r.distance:.4f}  sim={r.similarity:.4f}"
+                    if r.distance is not None
+                    else "dist=—"
+                )
+            else:
+                score_str = (
+                    f"fts={r.fts_score:.4f}"
+                    if r.fts_score is not None
+                    else "fts=—"
+                )
             console.rule(
                 f"[bold]Rank {r.rank}[/bold]  "
-                f"dist={r.distance:.4f}  "
-                f"sim={r.similarity:.4f}  "
+                f"{score_str}  "
                 f"chunk_id={r.chunk_id[:16]}…"
             )
             console.print(f"[dim]Document:[/dim] {r.document_id}")
@@ -179,25 +226,30 @@ def _print_results(
 
 
 async def _run(args: argparse.Namespace) -> int:
-    """Async main: set up embedding + retrieval, execute, print."""
+    """Async main: set up retriever, execute query, print results."""
     from config import settings
-    from documind.embeddings.service import create_embedding_service
-    from documind.retrieval.service import DenseRetriever, QueryValidationError
-    from db.session import get_engine, get_session_factory, get_async_session
+    from db.session import get_async_session, get_engine, get_session_factory
+    from documind.retrieval.validation import QueryValidationError
 
-    # Override database URL if supplied
     db_url = args.database_url or settings.database_url
-    model_name = args.model or settings.embedding_model
 
     try:
-        # Load embedding model (this takes a few seconds on first run)
-        logger.info("Loading embedding model: %s", model_name)
-        embedding_service = create_embedding_service(model_name)
-        retriever = DenseRetriever(embedding_service)
-
-        # Open a database session
         engine = get_engine(db_url)
         factory = get_session_factory(engine)
+
+        if args.method == "dense":
+            from documind.embeddings.service import create_embedding_service
+            from documind.retrieval.service import DenseRetriever
+
+            model_name = args.model or settings.embedding_model
+            logger.info("Loading embedding model: %s", model_name)
+            embedding_service = create_embedding_service(model_name)
+            retriever = DenseRetriever(embedding_service)
+
+        else:  # keyword
+            from documind.retrieval.keyword import KeywordRetriever
+
+            retriever = KeywordRetriever()  # type: ignore[assignment]
 
         async with get_async_session(factory) as session:
             results = await retriever.retrieve(
@@ -210,6 +262,7 @@ async def _run(args: argparse.Namespace) -> int:
         _print_results(
             query=args.query,
             results=results,
+            method=args.method,
             show_content=not args.no_content,
         )
         return 0
